@@ -391,22 +391,53 @@ func (d *swarmDriver) List(ctx context.Context, path string) ([]string, error) {
 }
 
 // Move moves an object stored at sourcePath to destPath, removing the original
-// object.
 func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath string) error {
 	d.mutex.Lock()
 	defer d.mutex.Unlock()
-	fmt.Println("Move:")
-	fmt.Println(sourcePath)
-	fmt.Println(destPath)
-	normalizedSrc, normalizedDst := normalize(sourcePath), normalize(destPath)
 
-	err := d.root.move(normalizedSrc, normalizedDst)
-	switch err {
-	case errNotExists:
-		return storagedriver.PathNotFoundError{Path: destPath}
-	default:
-		return err
+	// Lookup metadata for the source path
+	sourceMetaRef, err := d.lookuper.Get(ctx, filepath.Join(sourcePath, "mtdt"), time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("failed to lookup source metadata: %v", err)
 	}
+
+	// Create a joiner to read the source metadata
+	sourceMetaJoiner, _, err := joiner.New(ctx, d.store, sourceMetaRef)
+	if err != nil {
+		return fmt.Errorf("failed to create reader for source metadata: %v", err)
+	}
+
+	// Read the source metadata
+	sourceMeta, err := fromMetadata(sourceMetaJoiner)
+	if err != nil {
+		return fmt.Errorf("failed to read source metadata: %v", err)
+	}
+
+	// Update metadata to the new destination path
+	sourceMeta.Path = destPath
+	newMetaBuf, err := json.Marshal(sourceMeta)
+	if err != nil {
+		return fmt.Errorf("failed to marshal destination metadata: %v", err)
+	}
+
+	// Publish updated metadata to the destination path
+	newMetaRef, err := splitter.NewSimpleSplitter(d.store).Split(ctx, io.NopCloser(bytes.NewReader(newMetaBuf)), int64(len(newMetaBuf)), d.encrypt)
+	if err != nil {
+		return fmt.Errorf("failed to split destination metadata: %v", err)
+	}
+
+	err = d.publisher.Put(ctx, filepath.Join(destPath, "mtdt"), time.Now().Unix(), newMetaRef)
+	if err != nil {
+		return fmt.Errorf("failed to publish destination metadata: %v", err)
+	}
+
+	// Optionally, delete the source metadata
+	err = d.Delete(ctx, sourcePath)
+	if err != nil {
+		return fmt.Errorf("failed to delete source metadata: %v", err)
+	}
+
+	return nil
 }
 
 // Delete recursively deletes all objects stored at "path" and its subpaths.
