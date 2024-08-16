@@ -58,6 +58,7 @@ type metaData struct {
 	isDir    bool
 	Path     string
 	ModTime  int64
+	Size     int
 	children []string
 }
 
@@ -97,6 +98,7 @@ func fromMetadata(reader io.Reader) (metaData, error) {
 	if err != nil {
 		return metaData{}, fmt.Errorf("failed decoding metadata %w", err)
 	}
+	md.Size = len(buf)
 	return md, nil
 }
 
@@ -274,7 +276,6 @@ func (d *swarmDriver) reader(ctx context.Context, path string, offset int64) (io
 // at the location designated by "path" after the call to Commit.
 func (d *swarmDriver) Writer(ctx context.Context, path string, app bool) (storagedriver.FileWriter, error) {
 	var buf []byte
-
 	// Lookup new data at the specified path
 	newDataRef, err := d.lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
 	if err != nil {
@@ -318,40 +319,46 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, app bool) (storag
 	} else {
 		// If not appending, just use the new data
 		buf = newData
-	}
 
+	}
+	bufSize := int64(len(buf))
 	// Split the combined or new data using the splitter
 	splitter := splitter.NewSimpleSplitter(d.store)
-	r2, err := splitter.Split(ctx, io.NopCloser(bytes.NewReader(buf)), int64(len(buf)), d.encrypt)
+	r2, err := splitter.Split(ctx, io.NopCloser(bytes.NewReader(buf)), bufSize, d.encrypt)
 	if err != nil || isZeroAddress(r2) {
 		return nil, fmt.Errorf("failed to split content: %v", err)
 	}
 
 	// Create a new FileWriter with the combined or new data
-	return d.newWriter(r2), nil
+	return d.newWriter(r2, bufSize), nil
 }
 
 // Stat returns info about the provided path.
 func (d *swarmDriver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
 	d.mutex.RLock()
 	defer d.mutex.RUnlock()
-	fmt.Println("Stat:")
-	fmt.Println(path)
-	normalized := normalize(path)
-	found := d.root.find(normalized)
 
-	if found.path() != normalized {
-		return nil, storagedriver.PathNotFoundError{Path: path}
+	mtdt_ref, err := d.lookuper.Get(ctx, filepath.Join(path, "mtdt"), time.Now().Unix())
+	if err != nil {
+		return nil, fmt.Errorf("failed to lookup parent metadata: %v", err)
+	}
+	mtdt_joiner, _, err := joiner.New(ctx, d.store, mtdt_ref)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create reader for metadata: %v", err)
+	}
+	md, err := fromMetadata(mtdt_joiner)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read metadata: %v", err)
 	}
 
 	fi := storagedriver.FileInfoFields{
 		Path:    path,
-		IsDir:   found.isdir(),
-		ModTime: found.modtime(),
+		IsDir:   md.isDir,
+		ModTime: time.Unix(md.ModTime, 0),
 	}
 
 	if !fi.IsDir {
-		fi.Size = int64(len(found.(*file).data))
+		fi.Size = int64(md.Size)
 	}
 
 	return storagedriver.FileInfoInternal{FileInfoFields: fi}, nil
@@ -362,29 +369,25 @@ func (d *swarmDriver) Stat(ctx context.Context, path string) (storagedriver.File
 func (d *swarmDriver) List(ctx context.Context, path string) ([]string, error) {
 	d.mutex.RLock()
 	defer d.mutex.RUnlock()
-	fmt.Println("List:")
-	fmt.Println(path)
-	normalized := normalize(path)
 
-	found := d.root.find(normalized)
+	mtdt_ref, err := d.lookuper.Get(ctx, filepath.Join(path, "mtdt"), time.Now().Unix())
+	if err != nil {
+		return nil, fmt.Errorf("failed to lookup parent metadata: %v", err)
+	}
+	mtdt_joiner, _, err := joiner.New(ctx, d.store, mtdt_ref)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create reader for metadata: %v", err)
+	}
+	md, err := fromMetadata(mtdt_joiner)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read metadata: %v", err)
+	}
 
-	if !found.isdir() {
+	if !md.isDir {
 		return nil, fmt.Errorf("not a directory") // TODO(stevvooe): Need error type for this...
 	}
 
-	entries, err := found.(*dir).list(normalized)
-	if err != nil {
-		switch err {
-		case errNotExists:
-			return nil, storagedriver.PathNotFoundError{Path: path}
-		case errIsNotDir:
-			return nil, fmt.Errorf("not a directory")
-		default:
-			return nil, err
-		}
-	}
-
-	return entries, nil
+	return md.children, nil
 }
 
 // Move moves an object stored at sourcePath to destPath, removing the original
@@ -439,15 +442,17 @@ func (d *swarmDriver) Walk(ctx context.Context, path string, f storagedriver.Wal
 type swarmFile struct {
 	d         *swarmDriver
 	reference swarm.Address
+	bufSize   int64
 	closed    bool
 	committed bool
 	cancelled bool
 }
 
-func (d *swarmDriver) newWriter(ref swarm.Address) storagedriver.FileWriter {
+func (d *swarmDriver) newWriter(ref swarm.Address, bufSize int64) storagedriver.FileWriter {
 	return &swarmFile{
 		d:         d,
 		reference: ref,
+		bufSize:   bufSize,
 	}
 }
 
@@ -484,7 +489,7 @@ func (w *swarmFile) Size() int64 {
 	w.d.mutex.RLock()
 	defer w.d.mutex.RUnlock()
 
-	return int64(len(w.f.data))
+	return w.bufSize
 }
 
 func (w *swarmFile) Close() error {
@@ -511,7 +516,9 @@ func (w *swarmFile) Cancel(ctx context.Context) error {
 	w.d.mutex.Lock()
 	defer w.d.mutex.Unlock()
 
-	return w.d.root.delete(w.f.path())
+	w = nil
+
+	return nil
 }
 
 func (w *swarmFile) Commit(ctx context.Context) error {
