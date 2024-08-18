@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Raviraj2000/swarm-driver/store"
+	"github.com/Raviraj2000/swarmDriver/store"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethersphere/bee/pkg/feeds"
 	"github.com/ethersphere/bee/pkg/feeds/factory"
