@@ -113,6 +113,10 @@ func fromMetadata(reader io.Reader) (metaData, error) {
 	return md, nil
 }
 
+func (d *swarmDriver) Delete(ctx context.Context, path string) error {
+	return nil
+}
+
 // Implement remaining StorageDriver methods
 
 // GetContent retrieves the content stored at "path" as a []byte.
@@ -121,7 +125,7 @@ func (d *swarmDriver) GetContent(ctx context.Context, path string) ([]byte, erro
 
 	mtdtRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "mtdt"), time.Now().Unix())
 	if err != nil {
-		return nil, fmt.Errorf("failed to lookup parent metadata: %v", err)
+		return nil, fmt.Errorf("failed to lookup path metadata: %v", err)
 	}
 	mtdtJoiner, _, err := joiner.New(ctx, d.Store, mtdtRef)
 	if err != nil {
@@ -138,7 +142,7 @@ func (d *swarmDriver) GetContent(ctx context.Context, path string) ([]byte, erro
 
 	dataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
 	if err != nil {
-		return nil, fmt.Errorf("failed to lookup parent metadata: %v", err)
+		return nil, fmt.Errorf("failed to lookup path metadata: %v", err)
 	}
 
 	dataJoiner, _, err := joiner.New(ctx, d.Store, dataRef)
@@ -275,19 +279,6 @@ func (d *swarmDriver) reader(ctx context.Context, path string, offset int64) (io
 	return io.NopCloser(dataJoiner), nil
 }
 
-// Writer returns a FileWriter which will store the content written to it
-// at the location designated by "path" after the call to Commit.
-func (d *swarmDriver) Writer(ctx context.Context, path string, app bool) (storagedriver.FileWriter, error) {
-	// Lookup the new data reference at the specified path
-	newDataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
-	if err != nil {
-		return nil, fmt.Errorf("failed to lookup new data: %v", err)
-	}
-
-	// Create a new FileWriter with the data reference and append flag
-	return d.newWriter(newDataRef), nil
-}
-
 // Stat returns info about the provided path.
 func (d *swarmDriver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
 
@@ -320,22 +311,32 @@ func (d *swarmDriver) Stat(ctx context.Context, path string) (storagedriver.File
 // List returns a list of the objects that are direct descendants of the given
 // path.
 func (d *swarmDriver) List(ctx context.Context, path string) ([]string, error) {
-
+	// Retrieve metadata reference
 	mtdtRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "mtdt"), time.Now().Unix())
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup parent metadata: %v", err)
 	}
+
+	// Create a joiner to read the metadata
 	mtdtJoiner, _, err := joiner.New(ctx, d.Store, mtdtRef)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create reader for metadata: %v", err)
 	}
+
+	// Parse the metadata
 	mtdt, err := fromMetadata(mtdtJoiner)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read metadata: %v", err)
 	}
 
+	// Ensure it's a directory
 	if !mtdt.IsDir {
-		return nil, fmt.Errorf("not a directory") // TODO(stevvooe): Need error type for this...
+		return nil, fmt.Errorf("not a directory")
+	}
+
+	// Ensure children are not nil
+	if len(mtdt.Children) == 0 {
+		return nil, fmt.Errorf("no children found")
 	}
 
 	return mtdt.Children, nil
@@ -405,10 +406,14 @@ func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath stri
 		return fmt.Errorf("failed to publish destination metadata: %v", err)
 	}
 
-	// 5. Delete the old source metadata
-	err = d.Delete(ctx, sourcePath)
+	// 5. Add data from sourcepath to destpath
+	sourceDataRef, err := d.Lookuper.Get(ctx, filepath.Join(sourcePath, "data"), time.Now().Unix())
 	if err != nil {
-		return fmt.Errorf("failed to delete source metadata: %v", err)
+		return fmt.Errorf("failed to lookup destination parent metadata: %v", err)
+	}
+	err = d.Publisher.Put(ctx, filepath.Join(destPath, "data"), time.Now().Unix(), sourceDataRef)
+	if err != nil {
+		return fmt.Errorf("failed to publish destination metadata: %v", err)
 	}
 
 	return nil
@@ -424,22 +429,6 @@ func removeFromSlice(slice []string, item string) []string {
 	return slice
 }
 
-// Delete recursively deletes all objects stored at "path" and its subpaths.
-func (d *swarmDriver) Delete(ctx context.Context, path string) error {
-
-	fmt.Println("Delete:")
-	fmt.Println(path)
-	normalized := normalize(path)
-
-	err := d.root.delete(normalized)
-	switch err {
-	case errNotExists:
-		return storagedriver.PathNotFoundError{Path: path}
-	default:
-		return err
-	}
-}
-
 // RedirectURL returns a URL which may be used to retrieve the content stored at the given path.
 func (d *swarmDriver) RedirectURL(*http.Request, string) (string, error) {
 	return "", nil
@@ -450,23 +439,64 @@ func (d *swarmDriver) RedirectURL(*http.Request, string) (string, error) {
 func (d *swarmDriver) Walk(ctx context.Context, path string, f storagedriver.WalkFn, options ...func(*storagedriver.WalkOptions)) error {
 	fmt.Println("Walk:")
 	fmt.Println(path)
-	return storagedriver.WalkFallback(ctx, d, path, f, options...)
+	return nil
 }
 
 type swarmFile struct {
 	d         *swarmDriver
-	Reference swarm.Address
-	BufSize   int64
+	path      string
+	buffer    bytes.Buffer
+	bufSize   int64
 	closed    bool
 	committed bool
 	cancelled bool
+	offset    int64
+	//ref       swarm.Address
 }
 
-func (d *swarmDriver) newWriter(ref swarm.Address, bufSize int64) storagedriver.FileWriter {
+// Writer returns a FileWriter which will store the content written to it
+// at the location designated by "path" after the call to Commit.
+func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
+	var combinedData bytes.Buffer
+	w := &swarmFile{
+		d:       d,
+		path:    path,
+		bufSize: 0,
+	}
+
+	if append {
+		// Lookup existing data at the specified path
+		oldDataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
+		if err != nil {
+			return nil, fmt.Errorf("failed to lookup existing data: %v", err)
+		}
+
+		// Create a joiner to read the existing data
+		oldDataJoiner, _, err := joiner.New(ctx, d.Store, oldDataRef)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create reader for existing data: %v", err)
+		}
+
+		// Copy existing data into the buffer
+		if _, err := io.Copy(&combinedData, oldDataJoiner); err != nil {
+			return nil, fmt.Errorf("failed copying existing data: %v", err)
+		}
+
+		// Set the buffer and size in the writer
+		w.buffer = combinedData
+		w.bufSize = int64(combinedData.Len())
+	}
+
+	// Return the FileWriter
+	return w, nil
+}
+
+func (d *swarmDriver) newWriter(path string, buf bytes.Buffer, bufSize int64) storagedriver.FileWriter {
 	return &swarmFile{
-		d:         d,
-		Reference: ref,
-		BufSize:   bufSize,
+		d:       d,
+		path:    path,
+		bufSize: bufSize,
+		buffer:  buf,
 	}
 }
 
@@ -484,24 +514,14 @@ func (w *swarmFile) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("already cancelled")
 	}
 
-	if cap(w.buffer) < len(p)+w.buffSize {
-		data := make([]byte, len(w.buffer), len(p)+w.buffSize)
-		copy(data, w.buffer)
-		w.buffer = data
-	}
-
-	w.buffer = w.buffer[:w.buffSize+len(p)]
-	n := copy(w.buffer[w.buffSize:w.buffSize+len(p)], p)
-	w.buffSize += n
-
-	return n, nil
+	return 0, nil
 }
 
 func (w *swarmFile) Size() int64 {
 	w.d.Mutex.RLock()
 	defer w.d.Mutex.RUnlock()
 
-	return w.BufSize
+	return w.bufSize
 }
 
 func (w *swarmFile) Close() error {
@@ -509,10 +529,6 @@ func (w *swarmFile) Close() error {
 		return fmt.Errorf("already closed")
 	}
 	w.closed = true
-
-	if err := w.flush(); err != nil {
-		return err
-	}
 
 	return nil
 }
@@ -541,24 +557,22 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 	} else if w.cancelled {
 		return fmt.Errorf("already cancelled")
 	}
+
+	// Mark the file as committed
 	w.committed = true
 
-	if err := w.flush(); err != nil {
-		return err
+	// Create a splitter to handle the data in the buffer
+	splitter := splitter.NewSimpleSplitter(w.d.Store)
+	newRef, err := splitter.Split(ctx, io.NopCloser(bytes.NewReader(w.buffer.Bytes())), w.bufSize, w.d.Encrypt)
+	if err != nil {
+		return fmt.Errorf("failed to split buffer content: %v", err)
 	}
 
-	return nil
-}
-
-func (w *swarmFile) flush() error {
-	w.d.Mutex.Lock()
-	defer w.d.Mutex.Unlock()
-
-	if _, err := w.f.WriteAt(w.buffer, int64(len(w.f.data))); err != nil {
-		return err
+	// Publish the new reference to the specified path
+	err = w.d.Publisher.Put(ctx, filepath.Join(w.path, "data"), time.Now().Unix(), newRef)
+	if err != nil {
+		return fmt.Errorf("failed to publish data reference: %v", err)
 	}
-	w.buffer = []byte{}
-	w.BufSize = 0
 
 	return nil
 }

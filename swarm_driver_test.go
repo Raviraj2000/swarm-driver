@@ -3,15 +3,16 @@ package swarmDriver
 import (
 	"testing"
 
+	"github.com/Raviraj2000/swarmDriver/testStore"
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/testsuites"
+	"github.com/ethersphere/bee/pkg/swarm"
 )
 
 func newSwarmDriverConstructor() (storagedriver.StorageDriver, error) {
-	// Replace these with actual arguments required by your New function
-	addr := /* your swarm address */
-	store := /* your storage implementation */
-	encrypt := /* your encryption flag */
+	addr := swarm.NewAddress([]byte("0000000000000000000000000000000000000000000000000000000000000000"))
+	encrypt := false
+	store := testStore.NewSwarmInMemoryStore()
 
 	return New(addr, store, encrypt), nil
 }
