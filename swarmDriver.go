@@ -335,7 +335,7 @@ func (d *swarmDriver) List(ctx context.Context, path string) ([]string, error) {
 	}
 
 	// Ensure children are not nil
-	if len(mtdt.Children) == 0 {
+	if mtdt.Children == nil {
 		return nil, fmt.Errorf("no children found")
 	}
 
@@ -459,9 +459,12 @@ type swarmFile struct {
 func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
 	var combinedData bytes.Buffer
 	w := &swarmFile{
-		d:       d,
-		path:    path,
-		bufSize: 0,
+		d:         d,
+		path:      path,
+		bufSize:   0,
+		closed:    false,
+		committed: false,
+		cancelled: false,
 	}
 
 	if append {
@@ -482,23 +485,24 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (sto
 			return nil, fmt.Errorf("failed copying existing data: %v", err)
 		}
 
-		// Set the buffer and size in the writer
-		w.buffer = combinedData
-		w.bufSize = int64(combinedData.Len())
 	}
+
+	// Set the buffer and size in the writer
+	w.buffer = combinedData
+	w.bufSize = int64(combinedData.Len())
 
 	// Return the FileWriter
 	return w, nil
 }
 
-func (d *swarmDriver) newWriter(path string, buf bytes.Buffer, bufSize int64) storagedriver.FileWriter {
-	return &swarmFile{
-		d:       d,
-		path:    path,
-		bufSize: bufSize,
-		buffer:  buf,
-	}
-}
+// func (d *swarmDriver) newWriter(path string, buf bytes.Buffer, bufSize int64) storagedriver.FileWriter {
+// 	return &swarmFile{
+// 		d:       d,
+// 		path:    path,
+// 		bufSize: bufSize,
+// 		buffer:  buf,
+// 	}
+// }
 
 func (w *swarmFile) Read(buf []byte) (int, error) {
 
@@ -514,7 +518,19 @@ func (w *swarmFile) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("already cancelled")
 	}
 
-	return 0, nil
+	// Create a reader from the input byte slice
+	reader := bytes.NewReader(p)
+
+	// Copy the data from the reader to the buffer
+	n, err := io.Copy(&w.buffer, reader)
+	if err != nil {
+		return 0, fmt.Errorf("failed to copy data to buffer: %v", err)
+	}
+
+	// Update the buffer size
+	w.bufSize += n
+
+	return int(n), nil
 }
 
 func (w *swarmFile) Size() int64 {
