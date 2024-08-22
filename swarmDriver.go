@@ -14,10 +14,14 @@ import (
 
 	storagedriver "github.com/distribution/distribution/v3/registry/storage/driver"
 	"github.com/distribution/distribution/v3/registry/storage/driver/factory"
+	"github.com/ethereum/go-ethereum/common"
+	beecrypto "github.com/ethersphere/bee/pkg/crypto"
 	"github.com/ethersphere/bee/pkg/file/joiner"
 	"github.com/ethersphere/bee/pkg/file/splitter"
 	"github.com/ethersphere/bee/pkg/swarm"
 
+	"github.com/Raviraj2000/swarmDriver/lookuper"
+	"github.com/Raviraj2000/swarmDriver/publisher"
 	"github.com/Raviraj2000/swarmDriver/store"
 )
 
@@ -31,7 +35,7 @@ func init() {
 type swarmDriverFactory struct{}
 
 func (factory *swarmDriverFactory) Create(ctx context.Context, parameters map[string]interface{}) (storagedriver.StorageDriver, error) {
-	addr, ok := parameters["addr"].(swarm.Address)
+	addr, ok := parameters["addr"].(common.Address)
 	if !ok {
 		return nil, fmt.Errorf("missing or invalid 'addr' parameter")
 	}
@@ -87,11 +91,23 @@ func isZeroAddress(ref swarm.Address) bool {
 }
 
 // New constructs a new Driver.
-func New(addr swarm.Address, store store.PutGetter, encrypt bool) *swarmDriver {
+func New(addr common.Address, store store.PutGetter, encrypt bool) *swarmDriver {
+	pk, err := beecrypto.GenerateSecp256k1Key()
+	if err != nil {
+		panic(err)
+	}
+	signer := beecrypto.NewDefaultSigner(pk)
+	ethAddress, err := signer.EthereumAddress()
+	if err != nil {
+		panic(err)
+	}
+	lk := lookuper.New(store, ethAddress)
+	pb := publisher.New(store, signer, lookuper.Latest(store, addr))
 	return &swarmDriver{
 		Store:     store,
 		Encrypt:   encrypt,
-		Reference: addr,
+		Lookuper:  lk,
+		Publisher: pb,
 	}
 }
 
