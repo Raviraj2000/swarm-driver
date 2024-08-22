@@ -445,7 +445,7 @@ func (d *swarmDriver) Walk(ctx context.Context, path string, f storagedriver.Wal
 type swarmFile struct {
 	d         *swarmDriver
 	path      string
-	buffer    bytes.Buffer
+	buffer    *bytes.Buffer
 	bufSize   int64
 	closed    bool
 	committed bool
@@ -488,8 +488,7 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (sto
 	}
 
 	// Set the buffer and size in the writer
-	w.buffer = combinedData
-	w.bufSize = int64(combinedData.Len())
+	w.buffer = &combinedData
 
 	// Return the FileWriter
 	return w, nil
@@ -518,26 +517,14 @@ func (w *swarmFile) Write(p []byte) (int, error) {
 		return 0, fmt.Errorf("already cancelled")
 	}
 
-	// Create a reader from the input byte slice
-	reader := bytes.NewReader(p)
-
-	// Copy the data from the reader to the buffer
-	n, err := io.Copy(&w.buffer, reader)
-	if err != nil {
-		return 0, fmt.Errorf("failed to copy data to buffer: %v", err)
-	}
-
-	// Update the buffer size
-	w.bufSize += n
-
-	return int(n), nil
+	return w.buffer.Write(p)
 }
 
 func (w *swarmFile) Size() int64 {
 	w.d.Mutex.RLock()
 	defer w.d.Mutex.RUnlock()
 
-	return w.bufSize
+	return int64(w.buffer.Len())
 }
 
 func (w *swarmFile) Close() error {
@@ -579,7 +566,7 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 
 	// Create a splitter to handle the data in the buffer
 	splitter := splitter.NewSimpleSplitter(w.d.Store)
-	newRef, err := splitter.Split(ctx, io.NopCloser(bytes.NewReader(w.buffer.Bytes())), w.bufSize, w.d.Encrypt)
+	newRef, err := splitter.Split(ctx, io.NopCloser(w.buffer), int64(w.buffer.Len()), w.d.Encrypt)
 	if err != nil {
 		return fmt.Errorf("failed to split buffer content: %v", err)
 	}
@@ -589,6 +576,8 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to publish data reference: %v", err)
 	}
+
+	w.buffer.Reset()
 
 	return nil
 }
