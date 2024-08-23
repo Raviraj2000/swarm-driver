@@ -1,4 +1,4 @@
-module github.com/Raviraj2000/swarmDriver
+module github.com/Raviraj2000/swarmdriver
 
 go 1.22.4
 

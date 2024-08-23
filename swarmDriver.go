@@ -1,4 +1,4 @@
-package swarmDriver
+package swarmdriver
 
 import (
 	"bytes"
@@ -20,10 +20,10 @@ import (
 	"github.com/ethersphere/bee/pkg/file/splitter"
 	"github.com/ethersphere/bee/pkg/swarm"
 
-	"github.com/Raviraj2000/swarmDriver/lookuper"
-	"github.com/Raviraj2000/swarmDriver/publisher"
-	"github.com/Raviraj2000/swarmDriver/store"
-)                                                                           
+	"github.com/Raviraj2000/swarmdriver/lookuper"
+	"github.com/Raviraj2000/swarmdriver/publisher"
+	"github.com/Raviraj2000/swarmdriver/store"
+)
 
 const driverName = "swarm"
 
