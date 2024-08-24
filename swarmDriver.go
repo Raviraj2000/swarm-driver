@@ -132,6 +132,8 @@ func fromMetadata(reader io.Reader) (metaData, error) {
 }
 
 func (d *swarmDriver) Delete(ctx context.Context, path string) error {
+	d.Mutex.Lock()
+	defer d.Mutex.Unlock()
 	log.Printf("[INFO] Deleting path %s", path)
 
 	// Lookup metadata for the path
@@ -458,6 +460,8 @@ func (d *swarmDriver) List(ctx context.Context, path string) ([]string, error) {
 
 // Move moves an object stored at sourcePath to destPath, removing the original
 func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath string) error {
+	d.Mutex.Lock()
+	defer d.Mutex.Unlock()
 	log.Printf("[INFO] Move: source=%s, destination=%s \n", sourcePath, destPath)
 	// 1. Lookup and read source metadata
 	sourceMetaRef, err := d.Lookuper.Get(ctx, filepath.Join(sourcePath, "mtdt"), time.Now().Unix())
@@ -687,6 +691,8 @@ func (w *swarmFile) Cancel(ctx context.Context) error {
 }
 
 func (w *swarmFile) Commit(ctx context.Context) error {
+	w.d.Mutex.RLock()
+	defer w.d.Mutex.RUnlock()
 	log.Printf("[INFO] Commit initiated for path: %s", w.path)
 
 	if w.closed {
@@ -711,6 +717,8 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 	err = w.d.Publisher.Put(ctx, filepath.Join(w.path, "data"), time.Now().Unix(), newRef)
 	if err != nil {
 		return fmt.Errorf("Commit: failed to publish data reference: %v", err)
+	} else {
+		log.Printf("[INFO] Commit: Data commited for path: %s", w.path)
 	}
 
 	// Create metadata for the committed content
@@ -737,10 +745,12 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 	err = w.d.Publisher.Put(ctx, filepath.Join(w.path, "mtdt"), time.Now().Unix(), metaRef)
 	if err != nil {
 		return fmt.Errorf("Commit: failed to publish metadata reference: %v", err)
+	} else {
+		log.Printf("[INFO] Commit: MetaData commited for path: %s", w.path)
 	}
 
 	// Update parent metadata
-	parentPath := filepath.Dir(w.path)
+	parentPath := filepath.ToSlash(filepath.Dir(w.path))
 	parentMtdtRef, err := w.d.Lookuper.Get(ctx, filepath.Join(parentPath, "mtdt"), time.Now().Unix())
 	if err != nil {
 		// If parent metadata does not exist, create a new directory metadata
@@ -765,7 +775,7 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 			return fmt.Errorf("Commit: failed to publish new parent metadata reference: %v", err)
 		}
 
-		log.Printf("[INFO] Successfully created new parent metadata for path and published: %s", parentPath)
+		log.Printf("[INFO] Successfully created new parent metadata for path: %s", parentPath)
 	} else {
 		// Update existing parent metadata
 		parentMtdtJoiner, _, err := joiner.New(ctx, w.d.Store, parentMtdtRef)
