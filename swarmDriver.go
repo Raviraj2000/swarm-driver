@@ -133,6 +133,82 @@ func fromMetadata(reader io.Reader) (metaData, error) {
 
 func (d *swarmDriver) Delete(ctx context.Context, path string) error {
 	log.Printf("[INFO] Deleting path %s", path)
+
+	// Lookup metadata for the path
+	metaRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "mtdt"), time.Now().Unix())
+	if err != nil {
+		if err.Error() == "invalid chunk lookup" {
+			log.Fatalf("[Error] Delete: Could not find metadata path %s", path)
+		}
+		return storagedriver.PathNotFoundError{Path: path}
+	}
+
+	// Read metadata to determine if it's a directory or file
+	metaJoiner, _, err := joiner.New(ctx, d.Store, metaRef)
+	if err != nil {
+		return fmt.Errorf("failed to create reader for metadata: %v", err)
+	}
+	meta, err := fromMetadata(metaJoiner)
+	if err != nil {
+		return fmt.Errorf("failed to read metadata: %v", err)
+	}
+
+	// If the path is a directory, recursively delete all children
+	if meta.IsDir {
+		for _, child := range meta.Children {
+			childPath := filepath.Join(path, child)
+			if err := d.Delete(ctx, childPath); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Remove data if it's a file
+	err = d.Publisher.Put(ctx, filepath.Join(path, "data"), time.Now().Unix(), swarm.ZeroAddress)
+	if err != nil {
+		return fmt.Errorf("failed to remove data: %v", err)
+	}
+
+	// Update parent directory metadata to remove this path
+	parentPath := filepath.Dir(path)
+	parentMetaRef, err := d.Lookuper.Get(ctx, filepath.Join(parentPath, "mtdt"), time.Now().Unix())
+	if err != nil {
+		if err.Error() == "invalid chunk lookup" {
+			log.Fatalf("[Error] Delete: Could not find parent metadata path: %s", parentPath)
+		}
+		return storagedriver.PathNotFoundError{Path: parentPath}
+	}
+	parentMetaJoiner, _, err := joiner.New(ctx, d.Store, parentMetaRef)
+	if err != nil {
+		return fmt.Errorf("failed to create reader for parent metadata: %v", err)
+	}
+	parentMeta, err := fromMetadata(parentMetaJoiner)
+	if err != nil {
+		return fmt.Errorf("failed to read parent metadata: %v", err)
+	}
+	parentMeta.Children = removeFromSlice(parentMeta.Children, filepath.Base(path))
+
+	// Save updated parent metadata
+	parentMetaBuf, err := json.Marshal(parentMeta)
+	if err != nil {
+		return fmt.Errorf("failed to marshal parent metadata: %v", err)
+	}
+	parentMetaRefNew, err := splitter.NewSimpleSplitter(d.Store).Split(ctx, io.NopCloser(bytes.NewReader(parentMetaBuf)), int64(len(parentMetaBuf)), d.Encrypt)
+	if err != nil || isZeroAddress(parentMetaRefNew) {
+		return fmt.Errorf("failed to split parent metadata: %v", err)
+	}
+	err = d.Publisher.Put(ctx, filepath.Join(parentPath, "mtdt"), time.Now().Unix(), parentMetaRefNew)
+	if err != nil {
+		return fmt.Errorf("failed to publish parent metadata: %v", err)
+	}
+
+	// Remove the metadata for this path
+	err = d.Publisher.Put(ctx, filepath.Join(path, "mtdt"), time.Now().Unix(), swarm.ZeroAddress)
+	if err != nil {
+		return fmt.Errorf("failed to remove metadata: %v", err)
+	}
+
+	log.Printf("[INFO] Successfully deleted path %s", path)
 	return nil
 }
 
@@ -145,9 +221,9 @@ func (d *swarmDriver) GetContent(ctx context.Context, path string) ([]byte, erro
 	mtdtRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "mtdt"), time.Now().Unix())
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("Could not find parent path %s \n", path)
+			log.Fatalf("[Error] Delete: Could not find parent path %s \n", path)
 		}
-		return nil, fmt.Errorf("GetContent: failed to lookup path metadata: %v", err)
+		return nil, storagedriver.PathNotFoundError{Path: path}
 	}
 	mtdtJoiner, _, err := joiner.New(ctx, d.Store, mtdtRef)
 	if err != nil {
@@ -164,7 +240,10 @@ func (d *swarmDriver) GetContent(ctx context.Context, path string) ([]byte, erro
 
 	dataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
 	if err != nil {
-		return nil, fmt.Errorf("GetContent: failed to lookup path data: %v", err)
+		if err.Error() == "invalid chunk lookup" {
+			log.Fatalf("[Error] GetContent: Could not find data path %s \n", path)
+		}
+		return nil, storagedriver.PathNotFoundError{Path: path}
 	}
 
 	dataJoiner, _, err := joiner.New(ctx, d.Store, dataRef)
@@ -191,9 +270,9 @@ func (d *swarmDriver) PutContent(ctx context.Context, path string, content []byt
 	parentMtdtRef, err := d.Lookuper.Get(ctx, filepath.Join(parentPath, "mtdt"), time.Now().Unix())
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("Could not find parent path %s \n", parentPath)
+			log.Fatalf("[Error] PutContent: Could not find parent metadata path %s \n", parentPath)
 		}
-		return fmt.Errorf("PutContent: failed to lookup parent  metadata: %v", err)
+		return storagedriver.PathNotFoundError{Path: path}
 	}
 	parentMtdtRefJoiner, _, err := joiner.New(ctx, d.Store, parentMtdtRef)
 	if err != nil {
@@ -289,9 +368,9 @@ func (d *swarmDriver) reader(ctx context.Context, path string, offset int64) (io
 	dataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("Could not find path %s \n", path)
+			log.Fatalf("[Error] reader: Could not find path %s \n", path)
 		}
-		return nil, fmt.Errorf("reader: failed to lookup data: %v", err)
+		return nil, storagedriver.PathNotFoundError{Path: path}
 	}
 
 	// Create a joiner to read the data
@@ -314,9 +393,9 @@ func (d *swarmDriver) Stat(ctx context.Context, path string) (storagedriver.File
 	mtdtRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "mtdt"), time.Now().Unix())
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("Could not find metadata path %s \n", path)
+			log.Fatalf("[Error] Stat: Could not find metadata path %s \n", path)
 		}
-		return nil, fmt.Errorf("Stat: failed to lookup parent metadata: %v", err)
+		return nil, storagedriver.PathNotFoundError{Path: path}
 	}
 	mtdtJoiner, _, err := joiner.New(ctx, d.Store, mtdtRef)
 	if err != nil {
@@ -347,9 +426,9 @@ func (d *swarmDriver) List(ctx context.Context, path string) ([]string, error) {
 	mtdtRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "mtdt"), time.Now().Unix())
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("Could not find metadata path %s \n", path)
+			log.Fatalf("[Error] List: Could not find metadata path %s \n", path)
 		}
-		return nil, fmt.Errorf("List: failed to lookup parent metadata: %v", err)
+		return nil, storagedriver.PathNotFoundError{Path: path}
 	}
 
 	// Create a joiner to read the metadata
@@ -384,9 +463,9 @@ func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath stri
 	sourceMetaRef, err := d.Lookuper.Get(ctx, filepath.Join(sourcePath, "mtdt"), time.Now().Unix())
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("Could not find source metadata path %s \n", sourcePath)
+			log.Fatalf("[Error] Move: Could not find source metadata path %s \n", sourcePath)
 		}
-		return fmt.Errorf("Move: failed to lookup source metadata: %v", err)
+		return storagedriver.PathNotFoundError{Path: sourcePath}
 	}
 	sourceMetaJoiner, _, err := joiner.New(ctx, d.Store, sourceMetaRef)
 	if err != nil {
@@ -402,9 +481,9 @@ func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath stri
 	sourceParentMetaRef, err := d.Lookuper.Get(ctx, filepath.Join(sourceParentPath, "mtdt"), time.Now().Unix())
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("Could not find source parent metadata path %s \n", sourceParentPath)
+			log.Fatalf("[Error] Move: Could not find source parent metadata path %s \n", sourceParentPath)
 		}
-		return fmt.Errorf("Move: failed to lookup source parent metadata: %v", err)
+		return storagedriver.PathNotFoundError{Path: sourceParentPath}
 	}
 	sourceParentMetaJoiner, _, err := joiner.New(ctx, d.Store, sourceParentMetaRef)
 	if err != nil {
@@ -421,9 +500,9 @@ func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath stri
 	destParentMetaRef, err := d.Lookuper.Get(ctx, filepath.Join(destParentPath, "mtdt"), time.Now().Unix())
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("Could not find destination parent metadata path %s \n", destParentPath)
+			log.Fatalf("[Error] Move: Could not find destination parent metadata path %s \n", destParentPath)
 		}
-		return fmt.Errorf("Move: failed to lookup destination parent metadata: %v", err)
+		return storagedriver.PathNotFoundError{Path: destParentPath}
 	}
 	destParentMetaJoiner, _, err := joiner.New(ctx, d.Store, destParentMetaRef)
 	if err != nil {
@@ -454,9 +533,9 @@ func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath stri
 	sourceDataRef, err := d.Lookuper.Get(ctx, filepath.Join(sourcePath, "data"), time.Now().Unix())
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("Could not find source data path %s \n", sourcePath)
+			log.Fatalf("[Error] Move: Could not find source data path %s \n", sourcePath)
 		}
-		return fmt.Errorf("Move: failed to lookup source data: %v", err)
+		return storagedriver.PathNotFoundError{Path: sourcePath}
 	}
 	err = d.Publisher.Put(ctx, filepath.Join(destPath, "data"), time.Now().Unix(), sourceDataRef)
 	if err != nil {
@@ -521,9 +600,9 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (sto
 		oldDataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
 		if err != nil {
 			if err.Error() == "invalid chunk lookup" {
-				log.Fatalf("Could not find path %s \n", path)
+				log.Fatalf("[Error] Writer: Could not find path %s \n", path)
 			}
-			return nil, fmt.Errorf("Writer: failed to lookup old data: %v", err)
+			return nil, storagedriver.PathNotFoundError{Path: path}
 		}
 
 		// Create a joiner to read the existing data
@@ -608,7 +687,8 @@ func (w *swarmFile) Cancel(ctx context.Context) error {
 }
 
 func (w *swarmFile) Commit(ctx context.Context) error {
-	log.Printf("[INFO] Commit Hit")
+	log.Printf("[INFO] Commit initiated for path: %s", w.path)
+
 	if w.closed {
 		return fmt.Errorf("Commit: already closed")
 	} else if w.committed {
@@ -627,13 +707,111 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 		return fmt.Errorf("Commit: failed to split buffer content: %v", err)
 	}
 
-	// Publish the new reference to the specified path
+	// Publish the new data reference to the specified path
 	err = w.d.Publisher.Put(ctx, filepath.Join(w.path, "data"), time.Now().Unix(), newRef)
 	if err != nil {
 		return fmt.Errorf("Commit: failed to publish data reference: %v", err)
 	}
 
+	// Create metadata for the committed content
+	meta := metaData{
+		IsDir:   false,
+		Path:    w.path,
+		ModTime: time.Now().Unix(),
+		Size:    w.buffer.Len(),
+	}
+
+	// Marshal the metadata to JSON
+	metaJSON, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("Commit: failed to marshal metadata: %v", err)
+	}
+
+	// Split and store metadata
+	metaRef, err := splitter.Split(ctx, io.NopCloser(bytes.NewReader(metaJSON)), int64(len(metaJSON)), w.d.Encrypt)
+	if err != nil || isZeroAddress(metaRef) {
+		return fmt.Errorf("Commit: failed to split metadata: %v", err)
+	}
+
+	// Publish the metadata reference
+	err = w.d.Publisher.Put(ctx, filepath.Join(w.path, "mtdt"), time.Now().Unix(), metaRef)
+	if err != nil {
+		return fmt.Errorf("Commit: failed to publish metadata reference: %v", err)
+	}
+
+	// Update parent metadata
+	parentPath := filepath.Dir(w.path)
+	parentMtdtRef, err := w.d.Lookuper.Get(ctx, filepath.Join(parentPath, "mtdt"), time.Now().Unix())
+	if err != nil {
+		// If parent metadata does not exist, create a new directory metadata
+		parentMtdt := metaData{
+			IsDir:    true,
+			Path:     parentPath,
+			ModTime:  time.Now().Unix(),
+			Children: []string{w.path},
+		}
+
+		parentMetaJSON, err := json.Marshal(parentMtdt)
+		if err != nil {
+			return fmt.Errorf("Commit: failed to marshal new parent metadata: %v", err)
+		}
+
+		parentMetaRef, err := splitter.Split(ctx, io.NopCloser(bytes.NewReader(parentMetaJSON)), int64(len(parentMetaJSON)), w.d.Encrypt)
+		if err != nil || isZeroAddress(parentMetaRef) {
+			return fmt.Errorf("Commit: failed to split new parent metadata: %v", err)
+		}
+
+		if err := w.d.Publisher.Put(ctx, filepath.Join(parentPath, "mtdt"), time.Now().Unix(), parentMetaRef); err != nil {
+			return fmt.Errorf("Commit: failed to publish new parent metadata reference: %v", err)
+		}
+
+		log.Printf("[INFO] Successfully created new parent metadata for path and published: %s", parentPath)
+	} else {
+		// Update existing parent metadata
+		parentMtdtJoiner, _, err := joiner.New(ctx, w.d.Store, parentMtdtRef)
+		if err != nil {
+			return fmt.Errorf("Commit: failed to create joiner for parent metadata: %v", err)
+		}
+
+		parentMtdt, err := fromMetadata(parentMtdtJoiner)
+		if err != nil {
+			return fmt.Errorf("Commit: failed to read parent metadata: %v", err)
+		}
+
+		// Check if the path already exists in parent's children and add if not
+		found := false
+		for _, childPath := range parentMtdt.Children {
+			if childPath == w.path {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			parentMtdt.Children = append(parentMtdt.Children, w.path)
+			parentMtdt.ModTime = time.Now().Unix()
+
+			parentMetaJSON, err := json.Marshal(parentMtdt)
+			if err != nil {
+				return fmt.Errorf("Commit: failed to marshal updated parent metadata: %v", err)
+			}
+
+			parentMetaRef, err := splitter.Split(ctx, io.NopCloser(bytes.NewReader(parentMetaJSON)), int64(len(parentMetaJSON)), w.d.Encrypt)
+			if err != nil || isZeroAddress(parentMetaRef) {
+				return fmt.Errorf("Commit: failed to split updated parent metadata: %v", err)
+			}
+
+			if err := w.d.Publisher.Put(ctx, filepath.Join(parentPath, "mtdt"), time.Now().Unix(), parentMetaRef); err != nil {
+				return fmt.Errorf("Commit: failed to publish updated parent metadata reference: %v", err)
+			}
+
+			log.Printf("[INFO] Successfully updated parent metadata for path: %s", parentPath)
+		}
+	}
+
+	// Reset the buffer after committing data and metadata
 	w.buffer.Reset()
 
+	log.Printf("[INFO] Successfully committed data and metadata for path: %s", w.path)
 	return nil
 }
