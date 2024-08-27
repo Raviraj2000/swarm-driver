@@ -213,6 +213,9 @@ func (d *swarmDriver) putData(ctx context.Context, path string, data []byte) err
 
 // GetContent retrieves the content stored at "path" as a []byte.
 func (d *swarmDriver) GetContent(ctx context.Context, path string) ([]byte, error) {
+	d.Mutex.RLock()
+	defer d.Mutex.RUnlock()
+
 	log.Printf("[INFO] GetContent: Hit for path %v", path)
 
 	// Fetch metadata using the helper function
@@ -239,6 +242,9 @@ func (d *swarmDriver) GetContent(ctx context.Context, path string) ([]byte, erro
 }
 
 func (d *swarmDriver) PutContent(ctx context.Context, path string, content []byte) error {
+	d.Mutex.Lock()
+	defer d.Mutex.Unlock()
+
 	log.Printf("[INFO] PutContent: hit for Path: %v \n", path)
 
 	// Determine parent path
@@ -333,6 +339,10 @@ func (d *swarmDriver) Reader(ctx context.Context, path string, offset int64) (io
 
 // Stat returns info about the provided path.
 func (d *swarmDriver) Stat(ctx context.Context, path string) (storagedriver.FileInfo, error) {
+
+	d.Mutex.RLock()
+	defer d.Mutex.RUnlock()
+
 	log.Printf("[INFO] Stat: Hit for path %s", path)
 
 	// Fetch metadata using the helper function
@@ -361,6 +371,10 @@ func (d *swarmDriver) Stat(ctx context.Context, path string) (storagedriver.File
 
 // List returns a list of the objects that are direct descendants of the given path.
 func (d *swarmDriver) List(ctx context.Context, path string) ([]string, error) {
+
+	d.Mutex.RLock()
+	defer d.Mutex.RUnlock()
+
 	log.Printf("[INFO] List: Hit for path %s", path)
 
 	// Fetch metadata using the helper function
@@ -516,6 +530,10 @@ type swarmFile struct {
 // Writer returns a FileWriter which will store the content written to it
 // at the location designated by "path" after the call to Commit.
 func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (storagedriver.FileWriter, error) {
+
+	d.Mutex.Lock()
+	defer d.Mutex.Unlock()
+
 	log.Printf("[INFO] Writer: Hit for Path: %v \n", path)
 	var combinedData bytes.Buffer
 	w := &swarmFile{
@@ -585,8 +603,8 @@ func (w *swarmFile) Write(p []byte) (int, error) {
 
 func (w *swarmFile) Size() int64 {
 	log.Printf("[INFO] Size hit")
-	w.d.Mutex.RLock()
-	defer w.d.Mutex.RUnlock()
+	w.d.Mutex.Lock()
+	defer w.d.Mutex.Unlock()
 
 	return int64(w.buffer.Len())
 }
@@ -619,8 +637,10 @@ func (w *swarmFile) Cancel(ctx context.Context) error {
 }
 
 func (w *swarmFile) Commit(ctx context.Context) error {
+
 	w.d.Mutex.Lock()
 	defer w.d.Mutex.Unlock()
+
 	log.Printf("[INFO] Commit initiated for path: %s", w.path)
 
 	if w.closed {
