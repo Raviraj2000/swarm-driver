@@ -4,11 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -29,13 +30,19 @@ import (
 
 const driverName = "swarm"
 
+var logger *slog.Logger
+
 func init() {
 	factory.Register(driverName, &swarmDriverFactory{})
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})
+	logger = slog.New(handler)
 }
 
 // swarmDriverFactory implements the factory.StorageDriverFactory interface.
 type swarmDriverFactory struct{}
-
+     
 func (factory *swarmDriverFactory) Create(ctx context.Context, parameters map[string]interface{}) (storagedriver.StorageDriver, error) {
 	addr, ok := parameters["addr"].(common.Address)
 	if !ok {
@@ -177,10 +184,9 @@ func (d *swarmDriver) getData(ctx context.Context, path string) ([]byte, error) 
 	dataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Printf("[Error] getData: Could not find data path %s", path)
-			return nil, storagedriver.PathNotFoundError{Path: path}
+			logger.Error("Failed to find path", slog.String("path", path))
 		}
-		return nil, fmt.Errorf("getData: failed to lookup data reference: %v", err)
+		return nil, storagedriver.PathNotFoundError{Path: path}
 	}
 
 	dataJoiner, _, err := joiner.New(ctx, d.Store, dataRef)
@@ -213,18 +219,19 @@ func (d *swarmDriver) putData(ctx context.Context, path string, data []byte) err
 
 // GetContent retrieves the content stored at "path" as a []byte.
 func (d *swarmDriver) GetContent(ctx context.Context, path string) ([]byte, error) {
+
 	d.Mutex.RLock()
 	defer d.Mutex.RUnlock()
 
-	log.Printf("[INFO] GetContent: Hit for path %v", path)
+	logger.Info("GetContent Hit", slog.String("path", path))
 
 	// Fetch metadata using the helper function
 	mtdt, err := d.getMetadata(ctx, path)
 	if err != nil {
-		if errors.Is(err, storagedriver.PathNotFoundError{}) {
-			log.Fatalf("[Error] GetContent: Could not find metadata path %s", path)
+		if err.Error() == "invalid chunk lookup" {
+			logger.Error("Failed to lookup metadata for path", slog.String("path", path))
 		}
-		return nil, err
+		return nil, storagedriver.PathNotFoundError{Path: path}
 	}
 
 	// Check if data is a directory
@@ -242,21 +249,20 @@ func (d *swarmDriver) GetContent(ctx context.Context, path string) ([]byte, erro
 }
 
 func (d *swarmDriver) PutContent(ctx context.Context, path string, content []byte) error {
+
 	d.Mutex.Lock()
 	defer d.Mutex.Unlock()
 
-	log.Printf("[INFO] PutContent: hit for Path: %v \n", path)
+	logger.Info("PutContent Hit", slog.String("path", path))
 
 	// Determine parent path
 	parentPath := filepath.ToSlash(filepath.Dir(path))
-	log.Printf("PutContent: DataPath = %s \n", filepath.Base(path))
-	log.Printf("PutContent: ParentPath = %s \n", parentPath)
 
 	// Fetch parent metadata using the helper function
 	parentMtdt, err := d.getMetadata(ctx, parentPath)
 	if err != nil {
-		if errors.Is(err, storagedriver.PathNotFoundError{}) {
-			log.Fatalf("[Error] PutContent: Could not find parent metadata path %s \n", parentPath)
+		if err.Error() == "invalid chunk lookup" {
+			logger.Error("Failed to lookup parent metadata for path", slog.String("path", parentPath))
 		}
 		return err
 	}
@@ -308,7 +314,11 @@ func (d *swarmDriver) PutContent(ctx context.Context, path string, content []byt
 // Reader retrieves an io.ReadCloser for the content stored at "path" with a
 // given byte offset.
 func (d *swarmDriver) Reader(ctx context.Context, path string, offset int64) (io.ReadCloser, error) {
-	log.Printf("[INFO] Reader: Hit for path %s \n", path)
+
+	d.Mutex.RLock()
+	defer d.Mutex.RUnlock()
+
+	logger.Info("Reader Hit", slog.String("path", path))
 
 	if offset < 0 {
 		return nil, storagedriver.InvalidOffsetError{Path: path, Offset: offset}
@@ -318,7 +328,7 @@ func (d *swarmDriver) Reader(ctx context.Context, path string, offset int64) (io
 	dataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("[Error] reader: Could not find path %s \n", path)
+			logger.Error("Reader: Failed to lookup path", slog.String("path", path))
 		}
 		return nil, storagedriver.PathNotFoundError{Path: path}
 	}
@@ -343,15 +353,15 @@ func (d *swarmDriver) Stat(ctx context.Context, path string) (storagedriver.File
 	d.Mutex.RLock()
 	defer d.Mutex.RUnlock()
 
-	log.Printf("[INFO] Stat: Hit for path %s", path)
+	logger.Info("Stat Hit", slog.String("path", path))
 
 	// Fetch metadata using the helper function
 	mtdt, err := d.getMetadata(ctx, path)
 	if err != nil {
-		if errors.Is(err, storagedriver.PathNotFoundError{}) {
-			log.Fatalf("[Error] Stat: Could not find metadata path %s \n", path)
+		if err.Error() == "invalid chunk lookup" {
+			logger.Error("Stat: Failed to lookup Metadata path", slog.String("path", path))
 		}
-		return nil, err
+		return nil, storagedriver.PathNotFoundError{Path: path}
 	}
 
 	// Construct FileInfoFields from metadata
@@ -375,13 +385,13 @@ func (d *swarmDriver) List(ctx context.Context, path string) ([]string, error) {
 	d.Mutex.RLock()
 	defer d.Mutex.RUnlock()
 
-	log.Printf("[INFO] List: Hit for path %s", path)
+	logger.Info("List Hit", slog.String("path", path))
 
 	// Fetch metadata using the helper function
 	mtdt, err := d.getMetadata(ctx, path)
 	if err != nil {
-		if errors.Is(err, storagedriver.PathNotFoundError{}) {
-			log.Fatalf("[Error] List: Could not find metadata path %s \n", path)
+		if err.Error() == "invalid chunk lookup" {
+			logger.Error("List: Failed to lookup Metadata path", slog.String("path", path))
 		}
 		return nil, err
 	}
@@ -400,9 +410,11 @@ func (d *swarmDriver) List(ctx context.Context, path string) ([]string, error) {
 }
 
 func (d *swarmDriver) Delete(ctx context.Context, path string) error {
+
 	d.Mutex.Lock()
 	defer d.Mutex.Unlock()
-	log.Printf("[INFO] Deleting path %s", path)
+
+	logger.Info("Delete Hit", slog.String("path", path))
 
 	// Retrieve parent path
 	parentPath := filepath.Dir(path)
@@ -410,8 +422,8 @@ func (d *swarmDriver) Delete(ctx context.Context, path string) error {
 	// Fetch parent metadata using helper function
 	parentMeta, err := d.getMetadata(ctx, parentPath)
 	if err != nil {
-		if errors.Is(err, storagedriver.PathNotFoundError{}) {
-			log.Fatalf("[Error] Delete: Could not find parent metadata path: %s", parentPath)
+		if err.Error() == "invalid chunk lookup" {
+			logger.Error("Delete: Failed to lookup Metadata path", slog.String("path", path))
 		}
 		return err
 	}
@@ -431,15 +443,17 @@ func (d *swarmDriver) Delete(ctx context.Context, path string) error {
 
 // Move moves an object stored at sourcePath to destPath, removing the original
 func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath string) error {
+
 	d.Mutex.Lock()
 	defer d.Mutex.Unlock()
-	log.Printf("[INFO] Move: source=%s, destination=%s \n", sourcePath, destPath)
+
+	logger.Info("Move Hit", slog.String("sourcePath", sourcePath), slog.String("destPath", destPath))
 
 	// 1. Lookup and read source metadata
 	sourceMeta, err := d.getMetadata(ctx, sourcePath)
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("[Error] Move: Could not find source metadata path %s \n", sourcePath)
+			logger.Error("Move: Failed to lookup source Metadata path", slog.String("path", sourcePath))
 		}
 		return storagedriver.PathNotFoundError{Path: sourcePath}
 	}
@@ -449,7 +463,7 @@ func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath stri
 	sourceParentMeta, err := d.getMetadata(ctx, sourceParentPath)
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("[Error] Move: Could not find source parent metadata path %s \n", sourceParentPath)
+			logger.Error("Move: Failed to get source parent Metadata", slog.String("path", sourcePath))
 		}
 		return storagedriver.PathNotFoundError{Path: sourceParentPath}
 	}
@@ -463,7 +477,7 @@ func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath stri
 	destParentMeta, err := d.getMetadata(ctx, destParentPath)
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("[Error] Move: Could not find destination parent metadata path %s \n", destParentPath)
+			logger.Error("Move: Failed to lookup source Metadata path", slog.String("path", sourcePath))
 		}
 		return storagedriver.PathNotFoundError{Path: destParentPath}
 	}
@@ -482,7 +496,7 @@ func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath stri
 	sourceDataRef, err := d.getData(ctx, filepath.Join(sourcePath, "data"))
 	if err != nil {
 		if err.Error() == "invalid chunk lookup" {
-			log.Fatalf("[Error] Move: Could not find source data path %s \n", sourcePath)
+			logger.Error("Move: Failed to lookup source data path", slog.String("path", sourcePath))
 		}
 		return storagedriver.PathNotFoundError{Path: sourcePath}
 	}
@@ -504,15 +518,14 @@ func removeFromSlice(slice []string, item string) []string {
 
 // RedirectURL returns a URL which may be used to retrieve the content stored at the given path.
 func (d *swarmDriver) RedirectURL(*http.Request, string) (string, error) {
-	log.Printf("[INFO] Redirect hit")
+	logger.Info("RedirectURL Hit")
 	return "", nil
 }
 
 // Walk traverses a filesystem defined within driver, starting
 // from the given path, calling f on each file and directory
 func (d *swarmDriver) Walk(ctx context.Context, path string, f storagedriver.WalkFn, options ...func(*storagedriver.WalkOptions)) error {
-	log.Printf("[INFO] Walking path %s", path)
-	fmt.Println(path)
+	logger.Info("Walk Hit", slog.String("path", path))
 	return nil
 }
 
@@ -534,7 +547,7 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (sto
 	d.Mutex.Lock()
 	defer d.Mutex.Unlock()
 
-	log.Printf("[INFO] Writer: Hit for Path: %v \n", path)
+	logger.Info("Writer Hit", slog.String("path", path))
 	var combinedData bytes.Buffer
 	w := &swarmFile{
 		d:         d,
@@ -550,7 +563,7 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (sto
 		oldDataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
 		if err != nil {
 			if err.Error() == "invalid chunk lookup" {
-				log.Fatalf("[Error] Writer: Could not find path %s \n", path)
+				logger.Error("Move: Failed to fetch data", slog.String("path", path))
 			}
 			return nil, storagedriver.PathNotFoundError{Path: path}
 		}
@@ -575,21 +588,13 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (sto
 	return w, nil
 }
 
-// func (d *swarmDriver) newWriter(path string, buf bytes.Buffer, bufSize int64) storagedriver.FileWriter {
-// 	return &swarmFile{
-// 		d:       d,
-// 		path:    path,
-// 		bufSize: bufSize,
-// 		buffer:  buf,
-// 	}
-// }
-
-func (w *swarmFile) Read(buf []byte) (int, error) {
-	log.Printf("[INFO] Read hit")
-	return 0, nil
-}
-
 func (w *swarmFile) Write(p []byte) (int, error) {
+
+	w.d.Mutex.Lock()
+	defer w.d.Mutex.Unlock()
+
+	logger.Info("Write Hit", slog.String("path", w.path))
+
 	if w.closed {
 		return 0, fmt.Errorf("Write: already closed")
 	} else if w.committed {
@@ -602,15 +607,19 @@ func (w *swarmFile) Write(p []byte) (int, error) {
 }
 
 func (w *swarmFile) Size() int64 {
-	log.Printf("[INFO] Size hit")
-	w.d.Mutex.Lock()
-	defer w.d.Mutex.Unlock()
+
+	logger.Info("Size Hit", slog.String("path", w.path))
 
 	return int64(w.buffer.Len())
 }
 
 func (w *swarmFile) Close() error {
-	log.Printf("[INFO] Close hit")
+
+	w.d.Mutex.Lock()
+	defer w.d.Mutex.Unlock()
+
+	logger.Info("Close Hit", slog.String("path", w.path))
+
 	if w.closed {
 		return fmt.Errorf("Close: already closed")
 	}
@@ -620,16 +629,15 @@ func (w *swarmFile) Close() error {
 }
 
 func (w *swarmFile) Cancel(ctx context.Context) error {
-	log.Printf("[INFO] Cancel hit")
+
+	logger.Info("Cancel Hit", slog.String("path", w.path))
+
 	if w.closed {
 		return fmt.Errorf("Cancel: already closed")
 	} else if w.committed {
 		return fmt.Errorf("Cancel: already committed")
 	}
 	w.cancelled = true
-
-	w.d.Mutex.Lock()
-	defer w.d.Mutex.Unlock()
 
 	w = nil
 
@@ -641,7 +649,7 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 	w.d.Mutex.Lock()
 	defer w.d.Mutex.Unlock()
 
-	log.Printf("[INFO] Commit initiated for path: %s", w.path)
+	logger.Info("Commit Hit", slog.String("path", w.path))
 
 	if w.closed {
 		return fmt.Errorf("Commit: already closed")
