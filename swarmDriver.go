@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -114,18 +115,77 @@ func New(addr common.Address, store store.PutGetter, encrypt bool) *swarmDriver 
 	lk := lookuper.New(store, ethAddress)
 	pb := publisher.New(store, signer, lookuper.Latest(store, addr))
 	splitter := splitter.NewSimpleSplitter(store)
-	return &swarmDriver{
+
+	d := &swarmDriver{
 		Store:     store,
 		Encrypt:   encrypt,
 		Lookuper:  lk,
 		Publisher: pb,
 		Splitter:  splitter,
 	}
+
+	if err := d.addPathToRoot(context.Background(), ""); err != nil {
+		logger.Error("New: Failed to create root path:")
+	}
+
+	return d
+
 }
 
 // Implement the storagedriver.StorageDriver interface.
 func (d *swarmDriver) Name() string {
 	return driverName
+}
+
+func (d *swarmDriver) addPathToRoot(ctx context.Context, path string) error {
+	rootPath := "/"
+
+	// Retrieve root metadata
+	rootMeta, err := d.getMetadata(ctx, rootPath)
+	if err != nil {
+		// If root metadata does not exist, initialize it
+		rootMeta = metaData{
+			IsDir:    true,
+			Path:     rootPath,
+			ModTime:  time.Now().Unix(),
+			Children: []string{},
+		}
+	}
+	if path != "" {
+
+		// Add the path to the root's children if it's not already present
+		found := false
+		for _, child := range rootMeta.Children {
+			if child == path {
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			rootMeta.Children = append(rootMeta.Children, path)
+			rootMeta.ModTime = time.Now().Unix()
+		}
+	}
+
+	metaBuf, err := json.Marshal(rootMeta)
+	if err != nil {
+		return fmt.Errorf("putMetadata: failed to marshal metadata: %v", err)
+	}
+
+	metaRef, err := d.Splitter.Split(ctx, io.NopCloser(bytes.NewReader(metaBuf)), int64(len(metaBuf)), d.Encrypt)
+	if err != nil || isZeroAddress(metaRef) {
+		return fmt.Errorf("putMetadata: failed to split metadata: %v", err)
+	}
+
+	err = d.Publisher.Put(ctx, filepath.Join(rootPath, "mtdt"), time.Now().Unix(), metaRef)
+	if err != nil {
+		return fmt.Errorf("putMetadata: failed to publish metadata: %v", err)
+	}
+
+	logger.Info("addPathToRoot: Success!", slog.String("path", rootPath))
+
+	return nil
 }
 
 func fromMetadata(reader io.Reader) (metaData, error) {
@@ -142,12 +202,14 @@ func fromMetadata(reader io.Reader) (metaData, error) {
 }
 
 func (d *swarmDriver) getMetadata(ctx context.Context, path string) (metaData, error) {
-
 	path = filepath.ToSlash(path)
 
 	metaRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "mtdt"), time.Now().Unix())
 	if err != nil {
-		logger.Error("getMetadata: Failed to find path", slog.String("path", path))
+		if err.Error() == "invalid chunk lookup" || errors.Is(err, storagedriver.PathNotFoundError{}) {
+			logger.Warn("getMetadata: Path not found", slog.String("path", path))
+			return metaData{}, nil // or you could return a specific error if needed
+		}
 		return metaData{}, fmt.Errorf("getMetadata: failed to lookup metadata: %s %v", path, err)
 	}
 
@@ -165,6 +227,9 @@ func (d *swarmDriver) getMetadata(ctx context.Context, path string) (metaData, e
 }
 
 func (d *swarmDriver) putMetadata(ctx context.Context, path string, meta metaData) error {
+
+	logger.Info("PutMetadata Hit", slog.String("path", path))
+
 	metaBuf, err := json.Marshal(meta)
 	if err != nil {
 		return fmt.Errorf("putMetadata: failed to marshal metadata: %v", err)
@@ -180,11 +245,16 @@ func (d *swarmDriver) putMetadata(ctx context.Context, path string, meta metaDat
 		return fmt.Errorf("putMetadata: failed to publish metadata: %v", err)
 	}
 
+	logger.Info("putMetadata: Success!", slog.String("path", path))
+
 	// Update metadata for each parent directory up to the root
 	currentPath := path
 	for currentPath != "." {
 		currentPath = filepath.ToSlash(filepath.Dir(currentPath))
 		if currentPath == "." || currentPath == "/" {
+			if err := d.addPathToRoot(ctx, path); err != nil {
+				return fmt.Errorf("failed to add path to root: %v", err)
+			}
 			break
 		}
 
@@ -193,7 +263,7 @@ func (d *swarmDriver) putMetadata(ctx context.Context, path string, meta metaDat
 		if err != nil {
 			if err.Error() == "invalid chunk lookup" {
 				// If parent metadata does not exist, create a new directory metadata
-				logger.Error("Failed to lookup parent metadata for path", slog.String("path", currentPath))
+				logger.Error("putMetaData: Failed to lookup parent metadata for path", slog.String("path", currentPath))
 
 				parentMeta = metaData{
 					IsDir:    true,
@@ -201,6 +271,7 @@ func (d *swarmDriver) putMetadata(ctx context.Context, path string, meta metaDat
 					ModTime:  time.Now().Unix(),
 					Children: []string{},
 				}
+				logger.Error("putMetaData: Created Meta data for parent", slog.String("path", currentPath))
 			} else {
 				return err
 			}
@@ -235,7 +306,7 @@ func (d *swarmDriver) putMetadata(ctx context.Context, path string, meta metaDat
 				return fmt.Errorf("putMetadata: failed to publish parent metadata: %v", err)
 			}
 
-			logger.Info("Updated parent metadata", slog.String("path", currentPath))
+			logger.Info("putMetaData: Updated parent metadata", slog.String("path", currentPath))
 		}
 
 		// Move up to the next parent directory
@@ -322,7 +393,7 @@ func (d *swarmDriver) PutContent(ctx context.Context, path string, content []byt
 
 	// Split the content to get a data reference
 	if err := d.putData(ctx, filepath.Join(path, "data"), content); err != nil {
-		return fmt.Errorf("Move: failed to publish data to path: %s %v", path, err)
+		return fmt.Errorf("PutContent: failed to publish data to path: %s %v", path, err)
 	}
 
 	// Create and store metadata for the new content
@@ -333,12 +404,14 @@ func (d *swarmDriver) PutContent(ctx context.Context, path string, content []byt
 		Size:    len(content),
 	}
 
+	logger.Info("PutContent: Initiating Put for MetaData", slog.String("path", path))
 	if err := d.putMetadata(ctx, path, mtdt); err != nil {
 		return fmt.Errorf("PutContent: failed to store metadata: %v", err)
 	}
 
 	// Iterate up the directory structure to add each path part to its parent metadata
-	currentPath := path
+	nextPath := path
+	currentPath := nextPath
 	for currentPath != "." {
 		currentPath = filepath.ToSlash(filepath.Dir(currentPath))
 		if currentPath == "." || currentPath == "/" {
@@ -350,7 +423,7 @@ func (d *swarmDriver) PutContent(ctx context.Context, path string, content []byt
 		if err != nil {
 			if err.Error() == "invalid chunk lookup" {
 				// If parent metadata does not exist, create a new directory metadata
-				logger.Error("Failed to lookup parent metadata for path", slog.String("path", currentPath))
+				logger.Error("PutContent: Failed to lookup parent metadata for path", slog.String("path", currentPath))
 
 				currentMtdt = metaData{
 					IsDir:    true,
@@ -364,7 +437,7 @@ func (d *swarmDriver) PutContent(ctx context.Context, path string, content []byt
 		}
 
 		// Ensure the current path contains its child in the Children array
-		childPath := path
+		childPath := nextPath
 		found := false
 		for _, child := range currentMtdt.Children {
 			if child == childPath {
@@ -378,19 +451,19 @@ func (d *swarmDriver) PutContent(ctx context.Context, path string, content []byt
 			currentMtdt.Children = append(currentMtdt.Children, childPath)
 			currentMtdt.ModTime = time.Now().Unix()
 		}
-
+		logger.Info("PutContent: Initiating Put for MetaData", slog.String("path", currentPath))
 		// Store or update the metadata for the current path
 		if err := d.putMetadata(ctx, currentPath, currentMtdt); err != nil {
-			return fmt.Errorf("failed to update metadata for path %s: %v", currentPath, err)
+			return fmt.Errorf("PutContent: failed to update metadata for path %s: %v", currentPath, err)
 		}
 
 		// Log update of metadata
-		logger.Info("Updated metadata", slog.String("path", currentPath))
+		logger.Info("PutContent: Updated metadata", slog.String("path", currentPath))
 
 		// Move up to the next parent directory
-		path = currentPath
+		nextPath = currentPath
 	}
-
+	logger.Error("PutContent: Success!", slog.String("path", path))
 	return nil
 }
 
@@ -419,14 +492,14 @@ func (d *swarmDriver) Reader(ctx context.Context, path string, offset int64) (io
 	// Create a joiner to read the data
 	dataJoiner, _, err := joiner.New(ctx, d.Store, dataRef)
 	if err != nil {
-		return nil, fmt.Errorf("reader: failed to create joiner: %v", err)
+		return nil, fmt.Errorf("Reader: failed to create joiner: %v", err)
 	}
 
 	// Seek to the specified offset
 	if _, err := dataJoiner.Seek(offset, io.SeekStart); err != nil {
-		return nil, fmt.Errorf("reader: failed to seek to offset %d: %v", offset, err)
+		return nil, fmt.Errorf("Reader: failed to seek to offset %d: %v", offset, err)
 	}
-
+	logger.Info("Reader: Success", slog.String("path", path))
 	return io.NopCloser(dataJoiner), nil
 }
 
@@ -485,8 +558,13 @@ func (d *swarmDriver) List(ctx context.Context, path string) ([]string, error) {
 	}
 
 	// Ensure children are not nil
-	if mtdt.Children == nil {
+	if len(mtdt.Children) == 0 {
 		return nil, fmt.Errorf("List: no children found")
+	}
+
+	fmt.Printf("Children of path %s \n", path)
+	for _, c := range mtdt.Children {
+		fmt.Println(c)
 	}
 
 	return mtdt.Children, nil
@@ -500,27 +578,57 @@ func (d *swarmDriver) Delete(ctx context.Context, path string) error {
 	logger.Info("Delete Hit", slog.String("path", path))
 
 	// Retrieve parent path
-	parentPath := filepath.Dir(path)
 
-	// Fetch parent metadata using helper function
-	parentMeta, err := d.getMetadata(ctx, parentPath)
-	if err != nil {
-		if err.Error() == "invalid chunk lookup" {
-			logger.Error("Delete: Failed to lookup Metadata path", slog.String("path", path))
+	parentPath := filepath.ToSlash(filepath.Dir(path))
+
+	if parentPath != "/" {
+		// Fetch parent metadata using helper function
+		logger.Info("Delete: Parent path", slog.String("path", parentPath))
+
+		parentMeta, err := d.getMetadata(ctx, parentPath)
+		if err != nil {
+			if err.Error() == "invalid chunk lookup" {
+				logger.Error("Delete: Failed to lookup Metadata path", slog.String("path", parentPath))
+			}
+			return err
 		}
-		return err
+
+		// Remove the path from the parent metadata's children
+		parentMeta.Children = removeFromSlice(parentMeta.Children, path)
+
+		logger.Info("Delete: Initiating Put for MetaData", slog.String("path", parentPath))
+		// Update parent metadata using helper function
+		err = d.putMetadata(ctx, parentPath, parentMeta)
+		if err != nil {
+			return fmt.Errorf("Delete: failed to update parent metadata: %v", err)
+		}
+
+		log.Printf("[INFO] Successfully removed path %s from parent metadata", path)
+
+	} else {
+		logger.Info("Delete: Path", slog.String("path", path))
+		parentMeta, err := d.getMetadata(ctx, path)
+		if err != nil {
+			if err.Error() == "invalid chunk lookup" {
+				logger.Error("Delete: Failed to lookup Metadata path", slog.String("path", path))
+			}
+			return err
+		}
+
+		parentMeta.Children = []string{}
+		parentMeta.Path = ""
+
+		logger.Info("Delete: Initiating Put for MetaData", slog.String("path", path))
+		// Update parent metadata using helper function
+		err = d.putMetadata(ctx, path, parentMeta)
+		if err != nil {
+			return fmt.Errorf("Delete: failed to update parent metadata: %v", err)
+		}
+
+		log.Printf("[INFO] Successfully removed path %s from parent metadata", path)
+
 	}
 
-	// Remove the path from the parent metadata's children
-	parentMeta.Children = removeFromSlice(parentMeta.Children, filepath.Base(path))
-
-	// Update parent metadata using helper function
-	err = d.putMetadata(ctx, parentPath, parentMeta)
-	if err != nil {
-		return fmt.Errorf("Delete: failed to update parent metadata: %v", err)
-	}
-
-	log.Printf("[INFO] Successfully removed path %s from parent metadata", path)
 	return nil
 }
 
@@ -551,6 +659,7 @@ func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath stri
 		return storagedriver.PathNotFoundError{Path: sourceParentPath}
 	}
 	sourceParentMeta.Children = removeFromSlice(sourceParentMeta.Children, sourcePath)
+	logger.Info("Move: Initiating Put for MetaData", slog.String("path", sourceParentPath))
 	if err := d.putMetadata(ctx, sourceParentPath, sourceParentMeta); err != nil {
 		return fmt.Errorf("Move: failed to update source parent metadata: %v", err)
 	}
@@ -564,13 +673,17 @@ func (d *swarmDriver) Move(ctx context.Context, sourcePath string, destPath stri
 		}
 		return storagedriver.PathNotFoundError{Path: destParentPath}
 	}
+
 	destParentMeta.Children = append(destParentMeta.Children, destPath)
+
+	logger.Info("Move: Initiating Put for MetaData", slog.String("path", destParentPath))
 	if err := d.putMetadata(ctx, destParentPath, destParentMeta); err != nil {
 		return fmt.Errorf("Move: failed to update destination parent metadata: %v", err)
 	}
 
 	// 4. Update metadata to the new destination path
 	sourceMeta.Path = destPath
+	logger.Info("Move: Initiating Put for MetaData", slog.String("path", destPath))
 	if err := d.putMetadata(ctx, destPath, sourceMeta); err != nil {
 		return fmt.Errorf("Move: failed to update metadata at destination path: %v", err)
 	}
@@ -646,7 +759,7 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (sto
 		oldDataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
 		if err != nil {
 			if err.Error() == "invalid chunk lookup" {
-				logger.Error("Move: Failed to fetch data", slog.String("path", path))
+				logger.Error("Writer: Failed to fetch data", slog.String("path", path))
 			}
 			return nil, storagedriver.PathNotFoundError{Path: path}
 		}
@@ -746,7 +859,7 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("Commit: failed to publish data reference: %v", err)
 	}
-	logger.Info("Data committed", slog.String("path", w.path))
+	logger.Info("Commit: Data committed", slog.String("path", w.path))
 
 	// Create metadata for the committed content
 	meta := metaData{
@@ -757,10 +870,11 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 	}
 
 	// Publish the metadata using helper function
+	logger.Info("Commit: Initiating Put for MetaData", slog.String("path", w.path))
 	if err := w.d.putMetadata(ctx, w.path, meta); err != nil {
 		return fmt.Errorf("Commit: failed to publish metadata reference: %v", err)
 	}
-	logger.Info("Metadata committed", slog.String("path", w.path))
+	logger.Info("Commit: Metadata committed", slog.String("path", w.path))
 
 	// Reset the buffer after committing data and metadata
 	w.buffer.Reset()
@@ -768,6 +882,6 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 	// Mark the file as committed
 	w.committed = true
 
-	logger.Info("Successfully committed data and metadata", slog.String("path", w.path))
+	logger.Info("Commit: Successfully committed data and metadata", slog.String("path", w.path))
 	return nil
 }
