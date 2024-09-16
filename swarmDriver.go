@@ -196,6 +196,7 @@ func (d *swarmDriver) addPathToRoot(ctx context.Context, path string) error {
 			Children: []string{},
 		}
 	}
+
 	if path != "" {
 
 		// Add the path to the root's children if it's not already present
@@ -533,9 +534,7 @@ func (d *swarmDriver) Stat(ctx context.Context, path string) (storagedriver.File
 	// Fetch metadata using the helper function
 	mtdt, err := d.getMetadata(ctx, path)
 	if err != nil {
-		if err.Error() == "invalid chunk lookup" {
-			logger.Error("Stat: Failed to lookup Metadata path", slog.String("path", path))
-		}
+		logger.Info("Stat: Failed to lookup Metadata path", slog.String("path", path))
 		return nil, storagedriver.PathNotFoundError{Path: path, DriverName: d.Name()}
 	}
 
@@ -551,6 +550,7 @@ func (d *swarmDriver) Stat(ctx context.Context, path string) (storagedriver.File
 		fi.Size = int64(mtdt.Size)
 	}
 
+	logger.Info("Stat: Success!", slog.String("path", path))
 	return storagedriver.FileInfoInternal{FileInfoFields: fi}, nil
 }
 
@@ -570,9 +570,10 @@ func (d *swarmDriver) List(ctx context.Context, path string) ([]string, error) {
 	}
 
 	// // Ensure it's a directory
-	// if !mtdt.IsDir {
-	// 	return nil, fmt.Errorf("List: not a directory %s", path)
-	// }
+	if !mtdt.IsDir {
+		logger.Info("List: Not a directory", slog.String("path", path))
+		return nil, storagedriver.PathNotFoundError{Path: filepath.ToSlash(path), DriverName: d.Name()}
+	}
 
 	// Ensure children are not nil
 	if len(mtdt.Children) == 0 {
@@ -598,11 +599,13 @@ func (d *swarmDriver) Delete(ctx context.Context, path string) error {
 	// If the path is a directory, recursively delete its children
 	if meta.IsDir {
 		for _, child := range meta.Children {
-			childPath := filepath.Join(path, child)
+			// childPath := filepath.Join(path, child)
+			childPath := child
 			if err := d.Delete(ctx, childPath); err != nil {
 				logger.Info("Delete: Failed to delete child path", slog.String("childPath", childPath))
 				return storagedriver.PathNotFoundError{DriverName: d.Name(), Path: childPath}
 			}
+			logger.Info("Delete: Childpath deleted successfully!", slog.String("childPath", childPath))
 		}
 	}
 
@@ -728,7 +731,6 @@ type swarmFile struct {
 	d         *swarmDriver
 	path      string
 	buffer    *bytes.Buffer
-	bufSize   int64
 	closed    bool
 	committed bool
 	cancelled bool
@@ -748,19 +750,17 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (sto
 	w := &swarmFile{
 		d:         d,
 		path:      path,
-		bufSize:   0,
 		closed:    false,
 		committed: false,
 		cancelled: false,
 	}
 
 	if append {
+		logger.Info("Writer: Append True", slog.String("path", path))
 		// Lookup existing data at the specified path
 		oldDataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
 		if err != nil {
-			if err.Error() == "invalid chunk lookup" {
-				logger.Error("Writer: Failed to fetch data", slog.String("path", path))
-			}
+			logger.Error("Writer: Append: Failed to fetch data", slog.String("path", path))
 			return nil, storagedriver.PathNotFoundError{Path: path, DriverName: d.Name()}
 		}
 
