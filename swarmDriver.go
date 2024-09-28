@@ -246,7 +246,7 @@ func (d *swarmDriver) getMetadata(ctx context.Context, path string) (metaData, e
 }
 
 func (d *swarmDriver) putMetadata(ctx context.Context, path string, meta metaData) error {
-
+	logger.Debug("putMetadata Hit", slog.String("path", path))
 	// Marshal the metadata to JSON
 	metaBuf, err := json.Marshal(meta)
 	if err != nil {
@@ -273,6 +273,7 @@ func (d *swarmDriver) putMetadata(ctx context.Context, path string, meta metaDat
 	// Update metadata for each parent directory up to the root
 	for currentPath := filepath.ToSlash(filepath.Dir(path)); ; currentPath = filepath.ToSlash(filepath.Dir(currentPath)) {
 		// Retrieve parent metadata
+		logger.Debug("putMetadata: Updating parent metadata", slog.String("path", currentPath), slog.String("child", path))
 		parentMeta, err := d.getMetadata(ctx, currentPath)
 		if err != nil {
 			logger.Warn("putMetadata: Metadata not found. Creating new", slog.String("path", currentPath))
@@ -317,7 +318,7 @@ func (d *swarmDriver) putMetadata(ctx context.Context, path string, meta metaDat
 				return fmt.Errorf("putMetadata: failed to publish parent metadata: %v", err)
 			}
 		}
-
+		logger.Info("putMetadata: Updated parent metadata", "parentpath", currentPath, "children", parentMeta.Children)
 		// Break the loop if we have reached the root
 		if currentPath == "/" {
 			break
@@ -326,6 +327,7 @@ func (d *swarmDriver) putMetadata(ctx context.Context, path string, meta metaDat
 		// Move up to the parent directory
 		path = currentPath
 	}
+	logger.Debug("putMetadata: Success!", slog.String("path", path))
 	return nil
 }
 
@@ -346,8 +348,10 @@ func (d *swarmDriver) getData(ctx context.Context, path string) ([]byte, error) 
 }
 
 func (d *swarmDriver) putData(ctx context.Context, path string, data []byte) error {
+	logger.Debug("putData Hit", slog.String("path", path))
 	if len(data) == 0 {
-		emptyRef := swarm.NewAddress(nil)
+		logger.Warn("putData: Empty data", slog.String("path", path))
+		emptyRef := swarm.ZeroAddress
 		err := d.Publisher.Put(ctx, filepath.Join(path, "data"), time.Now().Unix(), emptyRef)
 		if err != nil {
 			return fmt.Errorf("putData: failed to publish empty data reference: %v", err)
@@ -497,15 +501,20 @@ func (d *swarmDriver) Reader(ctx context.Context, path string, offset int64) (io
 		logger.Error("Reader: Invalid offset", slog.String("path", path), slog.Int64("offset", offset))
 		return nil, storagedriver.InvalidOffsetError{Path: path, Offset: offset, DriverName: d.Name()}
 	}
+	logger.Debug("Reader: Valid offset", slog.String("path", path), slog.Int64("offset", offset))
 	if err := d.childExists(ctx, path); err != nil {
 		logger.Error("Reader: Child not found", slog.String("error", err.Error()))
 		return nil, storagedriver.PathNotFoundError{Path: path, DriverName: d.Name()}
 	}
+	logger.Debug("Reader: Child found", slog.String("path", path))
 	// Lookup data reference for the given path
 	dataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
-	if err != nil {
-		logger.Error("Reader: Failed to lookup data reference", slog.String("path", path))
+	if err != nil && !dataRef.Equal(swarm.ZeroAddress) {
+		logger.Error("Reader: Failed to lookup data reference", slog.String("path", path), slog.String("error", err.Error()), "dataref", dataRef)
 		return nil, storagedriver.PathNotFoundError{Path: path, DriverName: d.Name()}
+	} else if dataRef.Equal(swarm.ZeroAddress) {
+		logger.Warn("Reader: Data reference is zero", slog.String("path", path), "dataref", dataRef)
+		return io.NopCloser(bytes.NewReader([]byte{})), nil
 	}
 	// Create a joiner to read the data
 	dataJoiner, _, err := joiner.New(ctx, d.Store, dataRef)
@@ -761,6 +770,7 @@ type swarmFile struct {
 	committed bool
 	cancelled bool
 	offset    int64
+	size      int64
 }
 
 // Writer returns a FileWriter which will store the content written to it
@@ -770,7 +780,7 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (sto
 	d.Mutex.Lock()
 	defer d.Mutex.Unlock()
 
-	logger.Debug("Writer Hit", slog.String("path", path))
+	logger.Debug("Writer Hit", slog.String("path", path), slog.Bool("append", append))
 
 	var combinedData bytes.Buffer
 	w := &swarmFile{
@@ -779,17 +789,21 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (sto
 		closed:    false,
 		committed: false,
 		cancelled: false,
+		size:      0,
 	}
 
 	if append {
 		logger.Debug("Writer: Append True", slog.String("path", path))
 		// Lookup existing data at the specified path
 		oldDataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
-		if err != nil {
+		if err != nil && !oldDataRef.Equal(swarm.ZeroAddress) {
 			logger.Error("Writer: Append: Failed to fetch data", slog.String("path", path), slog.String("error", err.Error()))
 			return nil, storagedriver.PathNotFoundError{Path: path, DriverName: d.Name()}
+		} else if oldDataRef.Equal(swarm.ZeroAddress) {
+			logger.Warn("Writer: Append: Data reference is zero", slog.String("path", path))
+			w.buffer = &combinedData
+			return w, nil
 		}
-
 		// Create a joiner to read the existing data
 		oldDataJoiner, _, err := joiner.New(ctx, d.Store, oldDataRef)
 		if err != nil {
@@ -808,7 +822,7 @@ func (d *swarmDriver) Writer(ctx context.Context, path string, append bool) (sto
 
 	// Set the buffer and size in the writer
 	w.buffer = &combinedData
-
+	w.size = int64(w.buffer.Len())
 	logger.Debug("Writer: Success", slog.String("path", path))
 	// Return the FileWriter
 	return w, nil
@@ -826,15 +840,15 @@ func (w *swarmFile) Write(p []byte) (int, error) {
 	} else if w.cancelled {
 		return 0, fmt.Errorf("Write: already cancelled")
 	}
-
+	w.size += int64(len(p))
 	return w.buffer.Write(p)
 }
 
 func (w *swarmFile) Size() int64 {
 
-	logger.Debug("Size Hit", slog.String("path", w.path))
+	logger.Debug("Size Hit", slog.String("path", w.path), slog.Int64("size", int64(w.size)))
 
-	return int64(w.buffer.Len())
+	return int64(w.size)
 }
 
 func (w *swarmFile) Close() error {
@@ -905,13 +919,12 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 	if err := w.d.putMetadata(ctx, w.path, meta); err != nil {
 		return fmt.Errorf("Commit: failed to publish metadata reference: %v", err)
 	}
-
 	// Reset the buffer after committing data and metadata
 	w.buffer.Reset()
 
 	// Mark the file as committed
 	w.committed = true
 
-	logger.Debug("Commit: Successfully committed data and metadata", slog.String("path", w.path))
+	logger.Debug("Commit: Successfully committed data and metadata", slog.String("path", w.path), slog.Int64("size", int64(w.Size())))
 	return nil
 }
