@@ -273,7 +273,6 @@ func (d *swarmDriver) putMetadata(ctx context.Context, path string, meta metaDat
 	// Update metadata for each parent directory up to the root
 	for currentPath := filepath.ToSlash(filepath.Dir(path)); ; currentPath = filepath.ToSlash(filepath.Dir(currentPath)) {
 		// Retrieve parent metadata
-		logger.Debug("putMetadata: Updating parent metadata", slog.String("path", currentPath), slog.String("child", path))
 		parentMeta, err := d.getMetadata(ctx, currentPath)
 		if err != nil {
 			logger.Warn("putMetadata: Metadata not found. Creating new", slog.String("path", currentPath))
@@ -318,7 +317,6 @@ func (d *swarmDriver) putMetadata(ctx context.Context, path string, meta metaDat
 				return fmt.Errorf("putMetadata: failed to publish parent metadata: %v", err)
 			}
 		}
-		logger.Info("putMetadata: Updated parent metadata", "parentpath", currentPath, "children", parentMeta.Children)
 		// Break the loop if we have reached the root
 		if currentPath == "/" {
 			break
@@ -501,12 +499,10 @@ func (d *swarmDriver) Reader(ctx context.Context, path string, offset int64) (io
 		logger.Error("Reader: Invalid offset", slog.String("path", path), slog.Int64("offset", offset))
 		return nil, storagedriver.InvalidOffsetError{Path: path, Offset: offset, DriverName: d.Name()}
 	}
-	logger.Debug("Reader: Valid offset", slog.String("path", path), slog.Int64("offset", offset))
 	if err := d.childExists(ctx, path); err != nil {
 		logger.Error("Reader: Child not found", slog.String("error", err.Error()))
 		return nil, storagedriver.PathNotFoundError{Path: path, DriverName: d.Name()}
 	}
-	logger.Debug("Reader: Child found", slog.String("path", path))
 	// Lookup data reference for the given path
 	dataRef, err := d.Lookuper.Get(ctx, filepath.Join(path, "data"), time.Now().Unix())
 	if err != nil && !dataRef.Equal(swarm.ZeroAddress) {
@@ -552,7 +548,7 @@ func (d *swarmDriver) Stat(ctx context.Context, path string) (storagedriver.File
 	if !fi.IsDir {
 		fi.Size = int64(mtdt.Size)
 	}
-	logger.Debug("Stat: Success!", slog.String("path", path))
+	logger.Debug("Stat: Success!", slog.String("path", path), slog.Any("fi", fi))
 	return storagedriver.FileInfoInternal{FileInfoFields: fi}, nil
 }
 
@@ -925,6 +921,6 @@ func (w *swarmFile) Commit(ctx context.Context) error {
 	// Mark the file as committed
 	w.committed = true
 
-	logger.Debug("Commit: Successfully committed data and metadata", slog.String("path", w.path), slog.Int64("size", int64(w.Size())))
+	logger.Debug("Commit: Successfully committed data and metadata", slog.String("path", w.path))
 	return nil
 }
