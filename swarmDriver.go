@@ -762,7 +762,7 @@ func (d *swarmDriver) RedirectURL(*http.Request, string) (string, error) {
 // from the given path, calling f on each file and directory
 func (d *swarmDriver) Walk(ctx context.Context, path string, f storagedriver.WalkFn, options ...func(*storagedriver.WalkOptions)) error {
 	logger.Debug("Walk Hit", slog.String("path", path))
-	return nil
+	return storagedriver.WalkFallback(ctx, d, path, f, options...)
 }
 
 // swarmFile represents a file in the swarm storage system.
